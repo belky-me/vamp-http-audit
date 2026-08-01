@@ -172,6 +172,12 @@ REDIRECT_PARAMS = [
     "returl", "redirect_uri", "redirect_url", "return_url",
 ]
 
+# Rutas canónicas donde suele encontrarse un endpoint GraphQL
+GRAPHQL_PATHS = [
+    "/graphql", "/api/graphql", "/graphql/v1", "/api/v1/graphql",
+    "/query", "/gql", "/v1/graphql", "/api/query",
+]
+
 # Valores de Referrer-Policy considerados inseguros
 UNSAFE_REFERRER_POLICIES = {
     "unsafe-url":                   "Envía URL completa (con path y query) en todas las peticiones",
@@ -339,6 +345,15 @@ _R_DEBUG_HEADER = (
     "  · nginx:  proxy_hide_header X-Debug-Token;\n"
     "  · Revisar la configuración de entorno (DEBUG=False en Django/Flask)"
 )
+_R_GRAPHQL_INTROSPECTION = (
+    "Deshabilitar la introspección GraphQL en entornos de producción:\n"
+    "  · Apollo Server: introspection: false (NODE_ENV=production lo deshabilita por defecto)\n"
+    "  · GraphQL Yoga: useCSRFPrevention: true + deshabilitar introspección en prod\n"
+    "  · Hasura: HASURA_GRAPHQL_ENABLE_CONSOLE=false + deshabilitar schema introspection\n"
+    "  · graphene-django: GRAPHENE = {'SCHEMA': ..., 'INTROSPECTION': False}\n"
+    "  · Alternativa: limitar introspección por rol (sólo admin autenticado)\n"
+    "Ref: OWASP API Security Top 10 — API8:2023 (Security Misconfiguration)"
+)
 
 # ---------------------------------------------------------------------------
 # Estructuras de datos
@@ -390,6 +405,7 @@ class AuditResult:
     cors_credentials:      bool = False
     cors_null_accepted:    bool = False
     open_redirect_params:  list[str] = field(default_factory=list)  # Parámetros vulnerables
+    graphql_endpoints:     list[str] = field(default_factory=list)  # Endpoints GraphQL encontrados
     # Hallazgos
     findings:       list[Finding] = field(default_factory=list)
     grade:          str = ""
@@ -483,6 +499,7 @@ class HTTPAuditor:
                 self._phase_cookies(result)
                 self._phase_info_disclosure(result)
                 self._phase_open_redirect(result)
+                self._phase_graphql(result)
         except Exception as exc:
             result.error = str(exc)
         finally:
@@ -1034,6 +1051,108 @@ class HTTPAuditor:
                 remediation=_R_OPEN_REDIRECT, grade_cap="F",
             ))
 
+    def _phase_graphql(self, result: AuditResult) -> None:
+        """
+        Detecta endpoints GraphQL y verifica si la introspección está habilitada.
+
+        Prueba rutas canónicas (GRAPHQL_PATHS) con una query de tipado mínima
+        para confirmar presencia de un endpoint GraphQL, y luego lanza una query
+        de introspección completa para comprobar si expone el schema.
+
+        Hallazgos posibles:
+          · HIGH  — Introspección habilitada: el schema completo es público
+          · MEDIUM — Endpoint GraphQL encontrado pero sin introspección
+          · INFO   — Endpoint responde con error gráfico (p. ej. "Not Found" JSON)
+        """
+        import json as _json
+        import urllib.parse as _up
+
+        parsed   = urllib.parse.urlparse(result.url)
+        base     = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+        # Query mínima de detección (sólo pide __typename)
+        probe_body = b'{"query":"{ __typename }"}'
+        # Query de introspección completa
+        intro_body = (
+            b'{"query":"query IntrospectionQuery { __schema { '
+            b'types { name kind } queryType { name } } }"}'
+        )
+
+        introspection_on  : list[str] = []
+        endpoint_found    : list[str] = []
+
+        for path in GRAPHQL_PATHS:
+            url = f"{base}{path}"
+            try:
+                status, hdrs, body = self._fetch(
+                    url, method="POST",
+                    extra_headers={"Content-Type": "application/json"},
+                    body=probe_body,
+                )
+            except Exception:
+                continue
+
+            ct = hdrs.get("content-type", "")
+            if status not in (200, 400, 422) or "json" not in ct:
+                continue
+
+            try:
+                data = _json.loads(body)
+            except Exception:
+                continue
+
+            # Presencia confirmada: la respuesta tiene la estructura GraphQL
+            if not (isinstance(data, dict) and ("data" in data or "errors" in data)):
+                continue
+
+            endpoint_found.append(path)
+            result.graphql_endpoints.append(url)
+
+            # Ahora intenta introspección completa
+            try:
+                _, _, intro_raw = self._fetch(
+                    url, method="POST",
+                    extra_headers={"Content-Type": "application/json"},
+                    body=intro_body,
+                )
+                intro_data = _json.loads(intro_raw)
+                schema = (
+                    intro_data.get("data", {})
+                    .get("__schema", {})
+                )
+                if schema and schema.get("types"):
+                    introspection_on.append(path)
+            except Exception:
+                pass
+
+        if introspection_on:
+            result.findings.append(Finding(
+                severity="HIGH", category="GraphQL",
+                name=f"Introspección GraphQL habilitada: {', '.join(introspection_on)}",
+                detail=(
+                    f"Los endpoints {introspection_on} responden a consultas de introspección "
+                    "y exponen el schema completo de la API (tipos, campos, mutaciones). "
+                    "Un atacante puede mapear la superficie de ataque de la API sin autenticación."
+                ),
+                remediation=_R_GRAPHQL_INTROSPECTION, grade_cap="B",
+            ))
+        elif endpoint_found:
+            result.findings.append(Finding(
+                severity="MEDIUM", category="GraphQL",
+                name=f"Endpoint GraphQL detectado sin introspección: {', '.join(endpoint_found)}",
+                detail=(
+                    f"Se detectó presencia de GraphQL en {endpoint_found} "
+                    "pero la introspección está deshabilitada (configuración correcta). "
+                    "Verificar autenticación, depth limiting y query complexity en producción."
+                ),
+                remediation=(
+                    "Verificar que la autenticación y autorización son correctas en todos los "
+                    "resolvers. Implementar depth limiting y query complexity para evitar DoS. "
+                    "Ref: OWASP API Security — GraphQL Cheat Sheet"
+                ),
+                grade_cap="",
+            ))
+
 
 # ---------------------------------------------------------------------------
 # Reportes
@@ -1531,6 +1650,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--csv",      metavar="FILE", help="Exportar CSV (+ FILE.findings)")
     p.add_argument("--no-verify-ssl", dest="no_verify_ssl", action="store_true",
                    help="No verificar certificado TLS al hacer peticiones (útil para endpoints internos)")
+    from vampsec_report import add_report_args
+    add_report_args(p)
     return p.parse_args()
 
 
@@ -1602,11 +1723,76 @@ def main() -> None:
         console.print(f"[green]✔[/] CSV resumen: [bold]{ph}[/]")
         console.print(f"[green]✔[/] CSV hallazgos: [bold]{pf}[/]")
 
+    # Informes de cliente (formato unificado VSL)
+    if args.report_html or args.report_pdf:
+        from vampsec_report import VampSecReport, meta_from_args
+        meta    = meta_from_args(args, tool=TOOL_NAME, version=VERSION)
+        vsl_rep = VampSecReport(meta, _findings_vsl(results))
+        if args.report_html:
+            vsl_rep.to_html_client(args.report_html)
+            console.print(f"[green]✔[/] Informe cliente HTML: [bold]{args.report_html}[/]")
+        if args.report_pdf:
+            try:
+                vsl_rep.to_pdf(args.report_pdf)
+                console.print(f"[green]✔[/] Informe cliente PDF: [bold]{args.report_pdf}[/]")
+            except RuntimeError as e:
+                console.print(f"[yellow]⚠ PDF no generado: {e}[/yellow]")
+
     max_sev = "INFO"
     for r in results:
         if SEVERITY_ORDER.get(r.max_severity, 99) < SEVERITY_ORDER.get(max_sev, 99):
             max_sev = r.max_severity
     sys.exit(2 if max_sev == "CRITICAL" else 1 if max_sev == "HIGH" else 0)
+
+
+# =============================================================================
+# CONVERSIÓN A FORMATO DE INFORME UNIFICADO VSL
+# =============================================================================
+
+def _findings_vsl(results: list[AuditResult]) -> list:
+    """
+    Convierte los AuditResult de vamp-http-audit al formato Finding de vampsec_report.
+
+    Solo se incluyen hallazgos de severidad MEDIUM o superior. Los hallazgos INFO
+    quedan disponibles en los informes técnicos dark-theme y CSV, no en el informe
+    ejecutivo de cliente (exceso de ruido para el destinatario).
+    """
+    from vampsec_report import Finding as VSLFinding
+
+    VSL_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM"}
+    findings = []
+    n = 0
+    for r in results:
+        for f in r.findings:
+            if f.severity not in VSL_SEVERITIES:
+                continue
+            n += 1
+            # Construir evidencia contextual
+            ev_parts = [f"URL objetivo: {r.final_url or r.url}"]
+            if r.status_code:
+                ev_parts.append(f"HTTP {r.status_code}")
+            if f.detail:
+                ev_parts.append(f"Detalle: {f.detail}")
+            if f.grade_cap:
+                ev_parts.append(f"Cap de nota: {f.grade_cap} (nota final: {r.grade})")
+
+            findings.append(VSLFinding(
+                id          = f"HTTP-{n:03d}",
+                title       = f.name[:80],
+                severity    = f.severity,
+                description = (
+                    f"[{f.category}] {f.name}. "
+                    + (f.detail or "Hallazgo de seguridad en cabeceras/configuración HTTP.")
+                ),
+                evidence    = "\n".join(ev_parts),
+                affected    = r.final_url or r.url,
+                remediation = (
+                    f.remediation or
+                    "Revisar la configuración del servidor web y aplicar las cabeceras de seguridad recomendadas."
+                ),
+                tags        = ["http", "headers", f.category.lower().replace(" ", "-")],
+            ))
+    return findings
 
 
 if __name__ == "__main__":
